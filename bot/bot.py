@@ -1288,8 +1288,7 @@ async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_score(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await guard_group(update): return
     u = update.effective_user
-    user = update.effective_user
-    user_data = await get_user_async(user.id, user.username or "", user.first_name or "")
+    db = load_db()
     d = get_user(db, u.id, u.username or "", u.first_name)
     await update.message.reply_text(render_score(d), parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb_score())
 
@@ -1921,8 +1920,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u    = update.effective_user
     msg  = update.message
     text = msg.text or ""
-    user = update.effective_user
-    user_data = await get_user_async(user.id, user.username or "", user.first_name or "")
+    db   = load_db()
     d    = get_user(db, u.id, u.username or "", u.first_name)
 
     # Flood check
