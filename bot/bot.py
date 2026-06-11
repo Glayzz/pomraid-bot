@@ -1249,7 +1249,7 @@ def kb_confirm_unwallet():
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await guard_group(update): return
     u = update.effective_user
-    await get_user_async(u.id, u.username or "", u.first_name)
+    user_info = await get_user_async(u.id, u.username or "", u.first_name)
     await save_user_async(user_info)
     await update.message.reply_text(
         render_start(u.first_name),
