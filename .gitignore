@@ -9,13 +9,9 @@ __pycache__/
 venv/
 .venv/
 
-# Data (local JSON — not needed on Railway, using PostgreSQL)
+# Local-only data (Railway uses PostgreSQL)
 bot/data/
 data/
 
-# Temp files
+# Logs / temp
 *.log
-bot/bot_backup.py
-bot/top_section.py
-bot/bottom_section.py
-bot/middle_section.py

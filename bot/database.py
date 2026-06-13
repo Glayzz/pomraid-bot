@@ -257,7 +257,7 @@ async def _fetch_user_dict(conn, tg_uid: int) -> dict:
         "x_data": {
             "last_post_drop":        u["last_post_drop"].isoformat() if u["last_post_drop"] else None,
             "personal_post_history": list(post_history),
-            "credited_engagements":  json.loads(x_credits),
+            "credited_engagements":  dict(x_credits),
         },
     }
 
