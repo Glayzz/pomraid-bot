@@ -19,6 +19,23 @@ logger = logging.getLogger(__name__)
 
 _pool: Optional[asyncpg.Pool] = None
 
+
+async def _set_codecs(conn: asyncpg.Connection) -> None:
+    """Register JSONB codec so we get dicts/lists back, not strings."""
+    await conn.set_type_codec(
+        "jsonb",
+        encoder=json.dumps,
+        decoder=json.loads,
+        schema="pg_catalog",
+    )
+    await conn.set_type_codec(
+        "json",
+        encoder=json.dumps,
+        decoder=json.loads,
+        schema="pg_catalog",
+    )
+
+
 async def init_db() -> None:
     """
     Create the connection pool and initialise all tables.
@@ -33,9 +50,17 @@ async def init_db() -> None:
     # Railway appends ?sslmode=require — asyncpg needs ssl="require" kwarg
     if "sslmode=require" in database_url:
         database_url = database_url.replace("?sslmode=require", "").replace("&sslmode=require", "")
-        _pool = await asyncpg.create_pool(database_url, ssl="require", min_size=2, max_size=10)
+        _pool = await asyncpg.create_pool(
+            database_url, ssl="require",
+            min_size=2, max_size=10,
+            init=_set_codecs,
+        )
     else:
-        _pool = await asyncpg.create_pool(database_url, min_size=2, max_size=10)
+        _pool = await asyncpg.create_pool(
+            database_url,
+            min_size=2, max_size=10,
+            init=_set_codecs,
+        )
 
     await _create_tables()
     logger.info("PostgreSQL connected and tables ready.")
@@ -129,9 +154,9 @@ async def set_meta(key: str, value) -> None:
     async with get_pool().acquire() as conn:
         await conn.execute("""
             INSERT INTO meta (key, value)
-            VALUES ($1, $2::jsonb)
+            VALUES ($1, $2)
             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
-        """, key, json.dumps(value))
+        """, key, value)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -182,8 +207,8 @@ async def save_user(user_dict: dict) -> None:
                 offenses        = $8,
                 last_active     = $9,
                 last_post_drop  = $10,
-                post_history    = $11::jsonb,
-                x_credits       = $12::jsonb
+                post_history    = $11,
+                x_credits       = $12
             WHERE tg_uid = $1
         """,
             uid,
@@ -196,8 +221,8 @@ async def save_user(user_dict: dict) -> None:
             user_dict.get("offenses", 0),
             datetime.utcnow(),
             _parse_dt(user_dict.get("x_data", {}).get("last_post_drop")),
-            json.dumps(user_dict.get("x_data", {}).get("personal_post_history", [])),
-            json.dumps(user_dict.get("x_data", {}).get("credited_engagements", {})),
+            list(user_dict.get("x_data", {}).get("personal_post_history", [])),
+            dict(user_dict.get("x_data", {}).get("credited_engagements", {})),
         )
 
         # Update scores
