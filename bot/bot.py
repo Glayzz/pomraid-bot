@@ -127,8 +127,8 @@ def esc(text) -> str:
     """Escape HTML for safe rendering in Telegram messages."""
     return html.escape(str(text), quote=False)
 
-DIV  = "━━━━━━━━━━━━━━━━━━━━━━━━━━"
-DIV2 = "─────────────────────────────"
+DIV  = "━━━━━━━━━━━━━━━━━━"
+DIV2 = "─────────────────"
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  HELPERS
@@ -235,18 +235,44 @@ def x_get(url: str, params: dict | None = None) -> dict | None:
         return None
 
 
-def get_x_user(handle: str) -> tuple[str | None, int]:
-    """Look up an X user by handle. Returns (user_id, followers_count) or (None, 0)."""
+def get_x_user(handle: str) -> tuple[str | None, int, str]:
+    """
+    Look up an X user by handle.
+    Returns (user_id, followers_count, error_message).
+    error_message is "" on success, descriptive text on failure.
+    """
     handle = handle.lstrip("@").strip()
-    data = x_get(
-        f"https://api.twitter.com/2/users/by/username/{handle}",
-        {"user.fields": "public_metrics"},
-    )
-    if not data or "data" not in data:
-        return None, 0
-    user = data["data"]
-    followers = user.get("public_metrics", {}).get("followers_count", 0)
-    return user["id"], followers
+    if not X_BEARER_TOKEN:
+        return None, 0, "X_BEARER_TOKEN not set on server"
+    try:
+        r = httpx.get(
+            f"https://api.twitter.com/2/users/by/username/{handle}",
+            headers={"Authorization": f"Bearer {X_BEARER_TOKEN}"},
+            params={"user.fields": "public_metrics"},
+            timeout=15,
+        )
+        if r.status_code == 401:
+            return None, 0, "X API token invalid or expired (HTTP 401)"
+        if r.status_code == 403:
+            return None, 0, "X API token lacks permission (HTTP 403)"
+        if r.status_code == 429:
+            return None, 0, "X API rate-limited — wait 15 min and try again"
+        if r.status_code != 200:
+            return None, 0, f"X API returned HTTP {r.status_code}"
+        data = r.json()
+        if "data" not in data:
+            err = "User not found on X"
+            if "errors" in data and data["errors"]:
+                err = data["errors"][0].get("detail", err)
+            return None, 0, err
+        user = data["data"]
+        followers = user.get("public_metrics", {}).get("followers_count", 0)
+        return user["id"], followers, ""
+    except httpx.TimeoutException:
+        return None, 0, "X API timed out"
+    except Exception as e:
+        logger.error(f"get_x_user error: {e}")
+        return None, 0, f"X API error: {type(e).__name__}"
 
 
 def get_tweet_data(tweet_id: str) -> tuple[str | None, str]:
@@ -394,9 +420,9 @@ async def sync_x_engagement() -> dict:
         return summary
 
     if not POM_X_ID:
-        POM_X_ID, _ = get_x_user(POM_X_HANDLE)
+        POM_X_ID, _, err = get_x_user(POM_X_HANDLE)
         if not POM_X_ID:
-            summary["errors"].append(f"Cannot resolve @{POM_X_HANDLE}")
+            summary["errors"].append(f"Cannot resolve @{POM_X_HANDLE}: {err}")
             return summary
 
     # Build X user_id → user_dict map; resolve any missing x_user_ids
@@ -404,7 +430,7 @@ async def sync_x_engagement() -> dict:
     xid_map: dict[str, dict] = {}
     for u in all_users:
         if u.get("x_handle") and not u.get("x_user_id"):
-            xid, fl = get_x_user(u["x_handle"])
+            xid, fl, _err = get_x_user(u["x_handle"])
             if xid:
                 u["x_user_id"]   = xid
                 u["x_followers"] = fl
@@ -550,10 +576,34 @@ def kb_main() -> InlineKeyboardMarkup:
          InlineKeyboardButton("❓ How to Earn",    callback_data="howto")],
         [InlineKeyboardButton("💰 Reward Status",  callback_data="rewardstatus"),
          InlineKeyboardButton("📊 Weekly Preview", callback_data="weeklypreview")],
-        [InlineKeyboardButton("🐦 Link X",         callback_data="linkx_prompt"),
-         InlineKeyboardButton("🔄 Refresh X",      callback_data="refreshx")],
-        [InlineKeyboardButton("👛 Set Wallet",     callback_data="wallet_info"),
-         InlineKeyboardButton("🗑️ Remove Wallet", callback_data="unwallet")],
+        [InlineKeyboardButton("🐦 X Account",      callback_data="menu_x"),
+         InlineKeyboardButton("👛 Wallet",         callback_data="menu_wallet")],
+    ])
+
+def kb_x_menu(d: dict) -> InlineKeyboardMarkup:
+    """X Account submenu. Top button label changes based on whether X is linked."""
+    if d.get("x_handle"):
+        link_label = f"🔄 Re-link X"
+    else:
+        link_label = "🔗 Link X Account"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(link_label,         callback_data="linkx_prompt")],
+        [InlineKeyboardButton("🔄 Refresh X Data", callback_data="refreshx")],
+        [InlineKeyboardButton("❌ Unlink X",       callback_data="unlinkx")],
+        [InlineKeyboardButton("🔙 Back to Menu",   callback_data="back_main")],
+    ])
+
+def kb_wallet_menu(d: dict) -> InlineKeyboardMarkup:
+    """Wallet submenu. Buttons adapt to whether a wallet is set."""
+    if d.get("wallet"):
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("👛 View / Update Wallet", callback_data="wallet_info")],
+            [InlineKeyboardButton("🗑️ Remove Wallet",       callback_data="unwallet")],
+            [InlineKeyboardButton("🔙 Back to Menu",         callback_data="back_main")],
+        ])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("👛 Set Wallet",      callback_data="wallet_info")],
+        [InlineKeyboardButton("🔙 Back to Menu",    callback_data="back_main")],
     ])
 
 def kb_lb() -> InlineKeyboardMarkup:
@@ -576,10 +626,18 @@ def kb_score() -> InlineKeyboardMarkup:
 def kb_back() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Menu", callback_data="back_main")]])
 
-def kb_confirm(action: str) -> InlineKeyboardMarkup:
+def kb_x_back() -> InlineKeyboardMarkup:
+    """Back button that returns to X submenu (used after refresh / link confirm)."""
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to X Menu", callback_data="menu_x")]])
+
+def kb_wallet_back() -> InlineKeyboardMarkup:
+    """Back button that returns to Wallet submenu."""
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Wallet Menu", callback_data="menu_wallet")]])
+
+def kb_confirm(action: str, return_to: str = "back_main") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Yes", callback_data=f"{action}_confirm"),
-         InlineKeyboardButton("❌ Cancel", callback_data="back_main")],
+         InlineKeyboardButton("❌ Cancel", callback_data=return_to)],
     ])
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1062,6 +1120,66 @@ def render_wallet_info(d: dict) -> str:
         "<i>Rewards are paid automatically every Sunday in $POM</i>"
     )
 
+
+def render_x_menu(d: dict) -> str:
+    """Overview screen shown above the X submenu buttons."""
+    if d.get("x_handle"):
+        status_lines = [
+            f"✅ <b>Linked:</b> @{esc(d['x_handle'])}",
+            f"👥 <b>Followers:</b> {d.get('x_followers', 0):,}",
+        ]
+        action_hint = "Choose an action below:"
+    else:
+        status_lines = [
+            "❌ <b>No X account linked</b>",
+            "<i>You need to link X to earn raid points.</i>",
+        ]
+        action_hint = "Tap <b>Link X Account</b> to get started:"
+
+    return (
+        "🐦 <b>X Account</b>\n"
+        f"{DIV}\n\n"
+        + "\n".join(status_lines)
+        + f"\n\n{DIV2}\n"
+        f"{action_hint}\n\n"
+        "🔗 <b>Link X</b> — connect or change your X handle\n"
+        "🔄 <b>Refresh X Data</b> — update your follower count\n"
+        "❌ <b>Unlink X</b> — remove your X account\n"
+        f"{DIV}"
+    )
+
+
+def render_wallet_menu(d: dict) -> str:
+    """Overview screen shown above the Wallet submenu buttons."""
+    if d.get("wallet"):
+        addr = d["wallet"]
+        status_lines = [
+            f"✅ <b>Wallet Set</b>",
+            f"<code>{esc(addr[:8])}…{esc(addr[-6:])}</code>",
+            "",
+            "<i>You're eligible to receive $POM payouts every Sunday.</i>",
+        ]
+        action_hint = "Choose an action below:"
+    else:
+        status_lines = [
+            "⚠️ <b>No wallet set</b>",
+            "",
+            "<i>You won't receive rewards until you add a wallet.</i>",
+        ]
+        action_hint = "Tap <b>Set Wallet</b> to add one:"
+
+    return (
+        "👛 <b>Wallet</b>\n"
+        f"{DIV}\n\n"
+        + "\n".join(status_lines)
+        + f"\n\n{DIV2}\n"
+        f"{action_hint}\n\n"
+        "👛 <b>Set / View Wallet</b> — add or update your BNB address\n"
+        "🗑️ <b>Remove Wallet</b> — unlink your current address\n"
+        f"{DIV}\n"
+        "<i>BNB Chain only. Payments are irreversible.</i>"
+    )
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  USER COMMANDS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1076,11 +1194,29 @@ async def _reply(update: Update, text: str, kb=None, preview=False):
     )
 
 
+BANNER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pomraid_banner.png")
+
+
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await guard_group(update): return
     u = update.effective_user
     await get_or_create_user(u.id, u.username or "", u.first_name or "")
-    await _reply(update, render_start(u.first_name or "friend"), kb_main())
+    caption = render_start(u.first_name or "friend")
+    # Photo captions are limited to 1024 chars; render_start is ~500 so safe
+    try:
+        with open(BANNER_PATH, "rb") as banner:
+            await update.effective_message.reply_photo(
+                photo=banner,
+                caption=caption,
+                parse_mode=HTML,
+                reply_markup=kb_main(),
+            )
+    except FileNotFoundError:
+        # Fallback to text-only if banner image is missing
+        await _reply(update, caption, kb_main())
+    except Exception as e:
+        logger.warning(f"Banner send failed: {e}; falling back to text")
+        await _reply(update, caption, kb_main())
 
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1193,17 +1329,15 @@ async def cmd_linkx(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    xid, followers = get_x_user(handle)
+    xid, followers, err = get_x_user(handle)
 
     if not xid:
         await msg.edit_text(
-            f"❌ <b>Account Not Found</b>\n\n"
-            f"Could not find <b>@{esc(handle)}</b> on X.\n\n"
-            "Possible reasons:\n"
-            "• Handle spelled wrong\n"
-            "• Account is suspended or private\n"
-            "• X API temporarily rate-limited\n\n"
-            "<i>Try again in a minute, or double-check your handle.</i>",
+            f"❌ <b>Could Not Link @{esc(handle)}</b>\n\n"
+            f"<b>Reason:</b> {esc(err)}\n\n"
+            "<i>If this is your real handle, the issue is likely with the X API "
+            "(rate-limited or token problem). Try again in 15 minutes "
+            "or ask the admin to check the X_BEARER_TOKEN.</i>",
             parse_mode=HTML, reply_markup=kb_back(),
         )
         return
@@ -1277,11 +1411,11 @@ async def cmd_refreshx(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode=HTML, reply_markup=kb_back())
         return
 
-    xid, followers = get_x_user(handle)
+    xid, followers, err = get_x_user(handle)
     if not xid:
         await msg.edit_text(
-            f"❌ Could not reach X API for <b>@{esc(handle)}</b>.\n"
-            "Try again later.",
+            f"❌ Could not refresh <b>@{esc(handle)}</b>\n\n"
+            f"<b>Reason:</b> {esc(err)}",
             parse_mode=HTML, reply_markup=kb_back())
         return
 
@@ -1359,14 +1493,39 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     d = await get_or_create_user(u.id, u.username or "", u.first_name or "")
 
     async def edit(text: str, kb=None):
+        """
+        Edit the message. If the original is a photo (has caption, not text),
+        use edit_message_caption. Falls back to sending a new message.
+        """
         try:
-            await q.edit_message_text(text, parse_mode=HTML, reply_markup=kb,
-                                      disable_web_page_preview=True)
+            # Photo messages have .caption but no .text — use caption edit
+            if q.message and q.message.photo:
+                await q.edit_message_caption(
+                    caption=text, parse_mode=HTML, reply_markup=kb,
+                )
+            else:
+                await q.edit_message_text(
+                    text, parse_mode=HTML, reply_markup=kb,
+                    disable_web_page_preview=True,
+                )
         except Exception as e:
-            logger.warning(f"edit_message_text failed: {e}")
+            # If edit fails (e.g. message too old, or text identical), send new
+            logger.warning(f"edit failed, sending new: {e}")
+            try:
+                await ctx.bot.send_message(
+                    chat_id=q.message.chat.id,
+                    text=text, parse_mode=HTML, reply_markup=kb,
+                    disable_web_page_preview=True,
+                )
+            except Exception as e2:
+                logger.error(f"send_message fallback also failed: {e2}")
 
     if data == "back_main":
         await edit(render_start(u.first_name or "friend"), kb_main())
+    elif data == "menu_x":
+        await edit(render_x_menu(d), kb_x_menu(d))
+    elif data == "menu_wallet":
+        await edit(render_wallet_menu(d), kb_wallet_menu(d))
     elif data == "score":
         await edit(render_score(d), kb_score())
     elif data == "stats":
@@ -1381,28 +1540,30 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             text = text[:3950] + "\n<i>… message truncated</i>"
         await edit(text, kb_back())
     elif data == "wallet_info":
-        await edit(render_wallet_info(d), kb_back())
+        await edit(render_wallet_info(d), kb_wallet_back())
     elif data == "unwallet":
         if not d.get("wallet"):
             await edit(
                 "ℹ️ You don't have a wallet set.\n\nUse /wallet to add one.",
-                kb_back())
+                kb_wallet_back())
         else:
             await edit(
                 f"🗑️ <b>Remove Wallet?</b>\n\n"
                 f"Address: <code>{esc(d['wallet'][:8])}…{esc(d['wallet'][-6:])}</code>\n\n"
                 "You won't receive rewards without a wallet.\n"
                 "<i>This cannot be undone.</i>",
-                kb_confirm("unwallet"))
+                kb_confirm("unwallet", return_to="menu_wallet"))
     elif data == "unwallet_confirm":
         old = d.get("wallet", "")
         d["wallet"] = None
         await save_user(d)
+        # Refresh d so the submenu reflects the change
+        d = await get_or_create_user(u.id, u.username or "", u.first_name or "")
         await edit(
             f"✅ <b>Wallet Removed</b>\n\n"
             f"<code>{esc(old[:8])}…</code> has been unlinked.\n\n"
             "Use /wallet anytime to set a new address.",
-            kb_main())
+            kb_wallet_menu(d))
     elif data.startswith("lb_"):
         period = data[3:]
         text = await render_leaderboard(period)
@@ -1415,25 +1576,25 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"🐦 <b>Link Your X Account</b>\n\n{cur}"
             "Send the command:\n<code>/linkx @YourXHandle</code>\n\n"
             "<i>Example: /linkx @Glayzz_4T9ne_BK</i>",
-            kb_back())
+            kb_x_back())
     elif data == "refreshx":
         if not d.get("x_handle"):
             await edit(
                 "ℹ️ You don't have an X account linked.\n\nUse /linkx to connect one.",
-                kb_back())
+                kb_x_back())
         else:
             handle = d["x_handle"]
             if not X_BEARER_TOKEN:
                 await edit(
                     "❌ X_BEARER_TOKEN not set on server.",
-                    kb_back())
+                    kb_x_back())
                 return
-            xid, followers = get_x_user(handle)
+            xid, followers, err = get_x_user(handle)
             if not xid:
                 await edit(
-                    f"❌ Could not reach X API for <b>@{esc(handle)}</b>.\n"
-                    "Try again later.",
-                    kb_back())
+                    f"❌ Could not refresh <b>@{esc(handle)}</b>\n\n"
+                    f"<b>Reason:</b> {esc(err)}",
+                    kb_x_back())
                 return
             d["x_user_id"]   = xid
             d["x_followers"] = followers
@@ -1442,19 +1603,19 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"✅ <b>X Data Refreshed!</b>\n\n"
                 f"🐦 @{esc(handle)}\n"
                 f"👥 Followers: <b>{followers:,}</b>",
-                kb_back())
+                kb_x_back())
     elif data == "unlinkx":
         if not d.get("x_handle"):
             await edit(
                 "ℹ️ No X account linked.\n\nUse /linkx to connect one.",
-                kb_back())
+                kb_x_back())
         else:
             await edit(
                 f"⚠️ <b>Confirm Unlink</b>\n\n"
                 f"Unlink <b>@{esc(d['x_handle'])}</b>?\n\n"
                 "Your X score will be reset to <b>0</b> and all raid history cleared.\n"
                 "<i>This cannot be undone.</i>",
-                kb_confirm("unlinkx"))
+                kb_confirm("unlinkx", return_to="menu_x"))
     elif data == "unlinkx_confirm":
         old = d.get("x_handle", "")
         d["x_handle"]    = None
@@ -1465,12 +1626,13 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         for p in d.get("scores", {}).values():
             p["x"] = 0
         await save_user(d)
+        d = await get_or_create_user(u.id, u.username or "", u.first_name or "")
         await edit(
             f"✅ <b>Unlinked Successfully</b>\n\n"
             f"@{esc(old)} has been removed from your profile.\n"
             "Your X score has been reset to 0.\n\n"
             "Use /linkx anytime to connect a new account.",
-            kb_main())
+            kb_x_menu(d))
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  ADMIN COMMANDS
@@ -1881,7 +2043,7 @@ async def poll_pom_tweets(app: Application):
     if not X_BEARER_TOKEN:
         return
     if not POM_X_ID:
-        POM_X_ID, _ = get_x_user(POM_X_HANDLE)
+        POM_X_ID, _, _ = get_x_user(POM_X_HANDLE)
         if not POM_X_ID:
             return
 
