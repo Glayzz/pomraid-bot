@@ -8,7 +8,7 @@ import asyncpg
 import os
 import json
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -86,19 +86,23 @@ async def _create_tables() -> None:
     async with get_pool().acquire() as conn:
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
-                tg_uid          BIGINT      PRIMARY KEY,
-                username        TEXT        DEFAULT '',
-                first_name      TEXT        DEFAULT '',
-                x_handle        TEXT,
-                x_user_id       TEXT,
-                x_followers     INT         DEFAULT 0,
-                wallet          TEXT,
-                offenses        INT         DEFAULT 0,
-                joined          TIMESTAMPTZ DEFAULT NOW(),
-                last_active     TIMESTAMPTZ DEFAULT NOW(),
-                last_post_drop  TIMESTAMPTZ,
-                post_history    JSONB       DEFAULT '[]',
-                x_credits       JSONB       DEFAULT '{}'
+                tg_uid             BIGINT      PRIMARY KEY,
+                username           TEXT        DEFAULT '',
+                first_name         TEXT        DEFAULT '',
+                x_handle           TEXT,
+                x_user_id          TEXT,
+                x_followers        INT         DEFAULT 0,
+                wallet             TEXT,
+                offenses           INT         DEFAULT 0,
+                joined             TIMESTAMPTZ DEFAULT NOW(),
+                last_active        TIMESTAMPTZ DEFAULT NOW(),
+                last_post_drop     TIMESTAMPTZ,
+                post_history       JSONB       DEFAULT '[]',
+                x_credits          JSONB       DEFAULT '{}',
+                streak_days        INT         DEFAULT 0,
+                last_checkin_date  DATE,
+                last_unlink_at     TIMESTAMPTZ,
+                last_x_handle      TEXT
             );
 
             CREATE TABLE IF NOT EXISTS scores (
@@ -134,10 +138,74 @@ async def _create_tables() -> None:
                 value   JSONB
             );
 
+            CREATE TABLE IF NOT EXISTS tips_log (
+                id              SERIAL PRIMARY KEY,
+                from_uid        BIGINT NOT NULL,
+                from_username   TEXT,
+                to_uid          BIGINT NOT NULL,
+                to_username     TEXT,
+                amount_usd      NUMERIC(10,2),
+                amount_pom      NUMERIC(20,2),
+                tx_hash         TEXT,
+                created_at      TIMESTAMPTZ DEFAULT NOW(),
+                status          TEXT DEFAULT 'pending'
+            );
+
+            CREATE TABLE IF NOT EXISTS api_spend (
+                day             DATE PRIMARY KEY,
+                calls           INT  DEFAULT 0,
+                spent_usd       NUMERIC(10,4) DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS raffle_state (
+                week_start      DATE PRIMARY KEY,
+                entrants        JSONB DEFAULT '[]',
+                round1_winner   BIGINT,
+                round1_tx       TEXT,
+                round1_done     BOOLEAN DEFAULT FALSE,
+                round2_winner   BIGINT,
+                round2_tx       TEXT,
+                round2_done     BOOLEAN DEFAULT FALSE,
+                round3_winner   BIGINT,
+                round3_tx       TEXT,
+                round3_done     BOOLEAN DEFAULT FALSE,
+                round4_winner   BIGINT,
+                round4_tx       TEXT,
+                round4_done     BOOLEAN DEFAULT FALSE,
+                pool_usd        NUMERIC(10,2) DEFAULT 16.00,
+                created_at      TIMESTAMPTZ DEFAULT NOW()
+            );
+
             CREATE INDEX IF NOT EXISTS idx_scores_period ON scores(period);
             CREATE INDEX IF NOT EXISTS idx_engagements_tweet ON engagements(tweet_id);
             CREATE INDEX IF NOT EXISTS idx_engagements_user  ON engagements(tg_uid);
+            CREATE INDEX IF NOT EXISTS idx_tips_from ON tips_log(from_uid);
+            CREATE INDEX IF NOT EXISTS idx_tips_to ON tips_log(to_uid);
         """)
+
+        # Migrate existing users table — add new columns if missing
+        # (asyncpg doesn't error on IF NOT EXISTS, but ADD COLUMN does — use safe pattern)
+        for col, ddl in [
+            ("streak_days",       "INT DEFAULT 0"),
+            ("last_checkin_date", "DATE"),
+            ("last_unlink_at",    "TIMESTAMPTZ"),
+            ("last_x_handle",     "TEXT"),
+        ]:
+            try:
+                await conn.execute(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col} {ddl}")
+            except Exception as e:
+                logger.warning(f"Migration ALTER users ADD {col}: {e}")
+
+        # Migrate raffle_state — add round4 columns for existing deployments
+        for col, ddl in [
+            ("round4_winner", "BIGINT"),
+            ("round4_tx",     "TEXT"),
+            ("round4_done",   "BOOLEAN DEFAULT FALSE"),
+        ]:
+            try:
+                await conn.execute(f"ALTER TABLE raffle_state ADD COLUMN IF NOT EXISTS {col} {ddl}")
+            except Exception as e:
+                logger.warning(f"Migration ALTER raffle_state ADD {col}: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -437,6 +505,255 @@ async def get_total_x_points_this_week() -> int:
             "SELECT COALESCE(SUM(x_pts), 0) AS total FROM scores WHERE period='week'"
         )
         return row["total"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STREAK HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def get_streak(tg_uid: int) -> tuple[int, Optional[date]]:
+    """Returns (streak_days, last_checkin_date)."""
+    async with get_pool().acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT streak_days, last_checkin_date FROM users WHERE tg_uid=$1",
+            tg_uid,
+        )
+        if not row:
+            return 0, None
+        return row["streak_days"] or 0, row["last_checkin_date"]
+
+
+async def update_streak(tg_uid: int, new_streak: int, checkin_date: date) -> None:
+    async with get_pool().acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET streak_days=$2, last_checkin_date=$3 WHERE tg_uid=$1",
+            tg_uid, new_streak, checkin_date,
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  RELINK COOLDOWN HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def set_last_unlink(tg_uid: int, handle: str, when: Optional[datetime] = None) -> None:
+    """Mark when a user unlinked and which handle they had."""
+    when = when or datetime.utcnow()
+    async with get_pool().acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET last_unlink_at=$2, last_x_handle=$3 WHERE tg_uid=$1",
+            tg_uid, when, handle,
+        )
+
+
+async def get_unlink_info(tg_uid: int) -> tuple[Optional[datetime], Optional[str]]:
+    """Returns (last_unlink_at, last_x_handle) or (None, None) if never unlinked."""
+    async with get_pool().acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT last_unlink_at, last_x_handle FROM users WHERE tg_uid=$1",
+            tg_uid,
+        )
+        if not row:
+            return None, None
+        return row["last_unlink_at"], row["last_x_handle"]
+
+
+async def clear_unlink(tg_uid: int) -> None:
+    """Owner override — reset cooldown for a user."""
+    async with get_pool().acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET last_unlink_at=NULL, last_x_handle=NULL WHERE tg_uid=$1",
+            tg_uid,
+        )
+
+
+async def handle_taken_by_other(handle: str, excluding_uid: int) -> Optional[int]:
+    """Returns the TG UID currently using this X handle, or None if free."""
+    async with get_pool().acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT tg_uid FROM users WHERE LOWER(x_handle) = LOWER($1) AND tg_uid != $2",
+            handle, excluding_uid,
+        )
+        return row["tg_uid"] if row else None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  TIP LOG
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def log_tip(from_uid: int, from_username: str, to_uid: int, to_username: str,
+                  amount_usd: Optional[float], amount_pom: Optional[float],
+                  tx_hash: Optional[str], status: str = 'pending') -> int:
+    """Insert tip record; returns the ID."""
+    async with get_pool().acquire() as conn:
+        row = await conn.fetchrow("""
+            INSERT INTO tips_log (from_uid, from_username, to_uid, to_username,
+                                  amount_usd, amount_pom, tx_hash, status)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            RETURNING id
+        """, from_uid, from_username, to_uid, to_username,
+            amount_usd, amount_pom, tx_hash, status)
+        return row["id"]
+
+
+async def update_tip_status(tip_id: int, status: str, tx_hash: Optional[str] = None) -> None:
+    async with get_pool().acquire() as conn:
+        if tx_hash:
+            await conn.execute(
+                "UPDATE tips_log SET status=$2, tx_hash=$3 WHERE id=$1",
+                tip_id, status, tx_hash,
+            )
+        else:
+            await conn.execute(
+                "UPDATE tips_log SET status=$2 WHERE id=$1",
+                tip_id, status,
+            )
+
+
+async def get_recent_tips(limit: int = 20) -> list[dict]:
+    async with get_pool().acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM tips_log ORDER BY created_at DESC LIMIT $1",
+            limit,
+        )
+        return [dict(r) for r in rows]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  API SPEND TRACKING
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def record_api_spend(calls: int = 1, cost_usd: float = 0.005) -> None:
+    """Increment today's API spend counter."""
+    today = datetime.utcnow().date()
+    async with get_pool().acquire() as conn:
+        await conn.execute("""
+            INSERT INTO api_spend (day, calls, spent_usd)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (day) DO UPDATE SET
+                calls     = api_spend.calls + $2,
+                spent_usd = api_spend.spent_usd + $3
+        """, today, calls, cost_usd)
+
+
+async def get_api_spend(day: Optional[date] = None) -> dict:
+    """Get spend for a specific day, or today if None."""
+    if day is None:
+        day = datetime.utcnow().date()
+    async with get_pool().acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT calls, spent_usd FROM api_spend WHERE day=$1", day,
+        )
+        if not row:
+            return {"day": day, "calls": 0, "spent_usd": 0.0}
+        return {"day": day, "calls": row["calls"], "spent_usd": float(row["spent_usd"])}
+
+
+async def get_api_spend_range(days: int = 30) -> dict:
+    """Get total spend over the last N days."""
+    cutoff = datetime.utcnow().date() - timedelta(days=days)
+    async with get_pool().acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT COALESCE(SUM(calls), 0) AS calls,
+                   COALESCE(SUM(spent_usd), 0) AS spent_usd
+            FROM api_spend WHERE day >= $1
+        """, cutoff)
+        return {
+            "days":  days,
+            "calls": row["calls"] or 0,
+            "spent_usd": float(row["spent_usd"] or 0),
+        }
+
+
+async def get_api_spend_week() -> float:
+    """Total spend Monday → today."""
+    today  = datetime.utcnow().date()
+    monday = today - timedelta(days=today.weekday())
+    async with get_pool().acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT COALESCE(SUM(spent_usd), 0) AS total FROM api_spend WHERE day >= $1",
+            monday,
+        )
+        return float(row["total"] or 0)
+
+
+async def get_api_spend_month() -> float:
+    """Total spend this month."""
+    today      = datetime.utcnow().date()
+    month_start = today.replace(day=1)
+    async with get_pool().acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT COALESCE(SUM(spent_usd), 0) AS total FROM api_spend WHERE day >= $1",
+            month_start,
+        )
+        return float(row["total"] or 0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  RAFFLE STATE
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def get_or_create_raffle_state(week_start: date) -> dict:
+    """Fetch the raffle state for the given week; create empty record if missing."""
+    async with get_pool().acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM raffle_state WHERE week_start=$1", week_start,
+        )
+        if row:
+            return dict(row)
+        await conn.execute(
+            "INSERT INTO raffle_state (week_start, entrants) VALUES ($1, $2)",
+            week_start, [],
+        )
+        row = await conn.fetchrow(
+            "SELECT * FROM raffle_state WHERE week_start=$1", week_start,
+        )
+        return dict(row)
+
+
+async def save_raffle_entrants(week_start: date, entrants: list) -> None:
+    """Save the list of qualified raffle entrants (with their tickets)."""
+    async with get_pool().acquire() as conn:
+        await conn.execute(
+            "UPDATE raffle_state SET entrants=$2 WHERE week_start=$1",
+            week_start, entrants,
+        )
+
+
+async def save_raffle_round(week_start: date, round_num: int,
+                             winner_uid: Optional[int], tx_hash: Optional[str],
+                             done: bool = True) -> None:
+    """Record the outcome of a raffle round."""
+    if round_num not in (1, 2, 3, 4):
+        return
+    async with get_pool().acquire() as conn:
+        await conn.execute(f"""
+            UPDATE raffle_state SET
+                round{round_num}_winner = $2,
+                round{round_num}_tx     = $3,
+                round{round_num}_done   = $4
+            WHERE week_start = $1
+        """, week_start, winner_uid, tx_hash, done)
+
+
+async def get_raffle_state(week_start: date) -> Optional[dict]:
+    async with get_pool().acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM raffle_state WHERE week_start=$1", week_start,
+        )
+        return dict(row) if row else None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  30-DAY ROLLING TOTALS (for monthly loyalty)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def get_monthly_loyalty_top3() -> list[dict]:
+    """
+    Returns the top 3 users by their stored 'month' period totals.
+    This approximates 30-day rolling totals well enough — the 'month' bucket
+    is reset on the 1st, so on the 1st of next month it represents the prior month.
+    """
+    return await get_period_leaderboard("month", limit=3)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
